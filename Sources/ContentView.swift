@@ -4,6 +4,7 @@ import Photos
 import AVFoundation
 import UniformTypeIdentifiers
 import CoreTransferable
+import UIKit
 
 struct PickedMovie: Transferable {
     let url: URL
@@ -32,6 +33,8 @@ struct ContentView: View {
     @State private var busy = false
     @State private var alertMessage = ""
     @State private var showAlert = false
+    @State private var diagText = ""
+    @State private var copied = false
 
     private let converter = VideoConverter()
 
@@ -88,6 +91,33 @@ struct ContentView: View {
             }
             .disabled(sourceURL == nil || busy)
 
+            if !diagText.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ScrollView {
+                        Text(diagText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 150)
+                    .padding(8)
+                    .background(Color.gray.opacity(0.12))
+                    .cornerRadius(8)
+
+                    Button {
+                        UIPasteboard.general.string = diagText
+                        copied = true
+                    } label: {
+                        Text(copied ? "已复制，发给作者即可" : "复制诊断信息")
+                            .font(.footnote)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(Color.orange.opacity(0.18))
+                            .cornerRadius(8)
+                    }
+                }
+            }
+
             Spacer()
 
             Text("版本 " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"))
@@ -120,6 +150,7 @@ struct ContentView: View {
                     sourceURL = movie.url
                     sourceInfo = info
                     status = ""
+                    diagText = ""
                     busy = false
                 }
             } catch {
@@ -163,6 +194,8 @@ struct ContentView: View {
         guard let url = sourceURL else { return }
         busy = true
         progress = 0
+        diagText = ""
+        copied = false
         status = "正在准备（拼接循环）…"
 
         converter.convert(source: url, progress: { p in
@@ -175,9 +208,11 @@ struct ContentView: View {
             switch result {
             case .success(let out):
                 status = "转换完成，正在存相册…"
+                diagText = ""
                 saveToAlbum(url: out)
             case .failure(let err):
                 status = "转换失败"
+                diagText = Diag.dump()
                 alertMessage = err.localizedDescription
                 showAlert = true
             }
