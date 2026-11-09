@@ -57,19 +57,26 @@ enum Diag {
 /// 非标准比例不拉伸不裁切，用同画面的模糊放大版做背景补边。
 /// 不足 60 秒的循环补齐（规则与安卓版一致），超过 60 秒的保持原长。
 ///
-/// 循环的实现方式：**不使用 AVMutableComposition，也不做中间导出**。
-/// 而是同一个写入器连续写多遍——每一遍开一个新的 AVAssetReader 重新读源文件，
-/// 帧号接着往下排、音轨时间轴按段偏移。
+/// ## 为什么是两段式
 ///
-/// 关于 -11819：真机实测系统的解码服务（mediaserverd）偶尔会在转换中途崩一次。
-/// 崩过之后，旧 AVAsset 上的轨道对象就作废了，复用它们重试会立刻再报同样的错。
-/// 所以 v0.5 的做法是：读取一旦失败，等系统把解码服务拉起来（1.5 秒起步），
-/// 然后**整套换新**（新建 AVURLAsset + AVAssetReader），并从断点处续读——
-/// 已经写好的帧不浪费，输出时间轴照常连续。
+/// 真机上"一个写入器连续解码写多遍"这条路走不通：系统的解码服务（mediaserverd）
+/// 会偶尔中途崩一次，报 -11819。更麻烦的是它崩的时候，写入器里的硬件编码器
+/// 往往一起死了（之后 adaptor.pixelBufferPool 变 nil，报"编码器没有给出可用的画面缓冲"），
+/// 写入器救不回来，没法接着往下写。
+///
+/// 所以改成：
+/// 1. **第一段**：源视频只解码一遍 → 编成一条标准尺寸的短片段。
+///    崩了就把写入器也整套换新、从头重来（单遍只要一两秒，损失很小）。
+/// 2. **第二段**：把这条片段**原样复制** N 遍拼成 60 秒。
+///    这一步用直通（outputSettings = nil），只搬压缩数据包、不解码不重绘，
+///    不碰解码器和编码器，稳定性完全不同；顺带还快，源片只解一次码。
 final class VideoConverter {
 
     /// 如果真机上发现画面上下颠倒，把这里改成 true（只影响竖直方向，不影响左右）
     private static let verticalFlip = false
+
+    /// 目标总时长（秒）
+    private static let limitSeconds = 60.0
 
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private let queue = DispatchQueue(label: "com.bh.dayan.convert", qos: .userInitiated)
@@ -92,17 +99,16 @@ final class VideoConverter {
     // MARK: - 主流程
 
     private func run(source: URL, progress: @escaping (Double) -> Void) throws -> URL {
-        let asset = AVURLAsset(url: source)
-
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        let probe = AVURLAsset(url: source)
+        guard let track = probe.tracks(withMediaType: .video).first else {
             throw ConvertError.noVideoTrack
         }
 
-        var fps = Double(videoTrack.nominalFrameRate)
+        var fps = Double(track.nominalFrameRate)
         if fps < 20 || fps > 61 { fps = 30 }
         fps = fps.rounded()
 
-        let seconds = CMTimeGetSeconds(asset.duration)
+        let seconds = CMTimeGetSeconds(probe.duration)
         guard seconds.isFinite && seconds > 0 else {
             throw ConvertError.unknown("读不到视频时长")
         }
@@ -110,37 +116,135 @@ final class VideoConverter {
         // ---- 循环规则（与安卓版一致）----
         // 15 秒 → 4 遍 = 60 秒；20 秒 → 3 遍；25 秒 → 3 遍 75 秒裁到 60 秒；
         // 本来就 ≥60 秒的保持原长。留 0.5 秒余量，14.97 秒不会算成 5 遍。
-        let targetSeconds = 60.0
+        let limit = VideoConverter.limitSeconds
         var loops = 1
-        if seconds < targetSeconds - 0.5 {
-            loops = max(2, Int(ceil((targetSeconds - 0.5) / seconds)))
+        if seconds < limit - 0.5 {
+            loops = max(2, Int(ceil((limit - 0.5) / seconds)))
         }
-        let outSeconds = loops > 1 ? min(seconds * Double(loops), targetSeconds) : seconds
-        let targetFrames = max(1, Int((outSeconds * fps).rounded()))
-        Diag.add("源 \(String(format: "%.2f", seconds)) 秒 / \(Int(fps)) 帧 / 写 \(loops) 遍 / 目标 \(String(format: "%.1f", outSeconds)) 秒 \(targetFrames) 帧")
+        let targetSeconds = loops > 1 ? min(seconds * Double(loops), limit) : seconds
+        let passFrames = max(1, Int((seconds * fps).rounded()))
 
         // ---- 方向与目标尺寸 ----
-        let naturalSize = videoTrack.naturalSize
-        let transform = videoTrack.preferredTransform
-        let displayRect = CGRect(origin: .zero, size: naturalSize).applying(transform)
-        let displayW = abs(displayRect.width)
-        let displayH = abs(displayRect.height)
+        let rect = CGRect(origin: .zero, size: track.naturalSize).applying(track.preferredTransform)
+        let displayW = abs(rect.width)
+        let displayH = abs(rect.height)
         guard displayW > 1 && displayH > 1 else {
             throw ConvertError.noVideoTrack
         }
         let portrait = displayH >= displayW
         let outW = portrait ? 1080 : 1920
         let outH = portrait ? 1920 : 1080
-        let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
-        Diag.add("画面 \(Int(displayW))x\(Int(displayH)) → \(outW)x\(outH)")
 
-        // 源文件有没有音轨（后面每遍读取都重新确认）
-        let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+        // 源片本来就是这个尺寸、而且没有旋转时，第一段不用重绘画面，
+        // 解码出来直接交给编码器，又快又省
+        let t = track.preferredTransform
+        let identity = abs(t.a - 1) < 0.001 && abs(t.b) < 0.001
+            && abs(t.c) < 0.001 && abs(t.d - 1) < 0.001
+        let needRender = !(identity
+            && Int(displayW.rounded()) == outW
+            && Int(displayH.rounded()) == outH)
 
-        // ---- 写入器 ----
-        let outURL = FileManager.default.temporaryDirectory
+        Diag.add("源 \(String(format: "%.2f", seconds)) 秒 / \(Int(fps)) 帧 / 循环 \(loops) 遍 / 目标 \(String(format: "%.1f", targetSeconds)) 秒")
+        Diag.add("画面 \(Int(displayW))x\(Int(displayH)) → \(outW)x\(outH)"
+                 + (needRender ? "（需要重绘）" : "（尺寸已达标，直接转码）"))
+
+        // ================= 第一段：源视频 → 标准尺寸片段（只解码一遍） =================
+        let segURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayan_seg_\(UUID().uuidString).mp4")
+
+        var lastError: Error?
+        var segDone = false
+        for attempt in 1...3 {
+            if attempt > 1 {
+                let wait = Double(attempt - 1) * 1.5
+                Diag.add("等 \(String(format: "%.1f", wait)) 秒让系统解码服务恢复，换全新解码器从头上重来")
+                Thread.sleep(forTimeInterval: wait)
+            }
+            do {
+                try autoreleasepool {
+                    try self.encodeSegment(source: source,
+                                           to: segURL,
+                                           fps: fps,
+                                           passFrames: passFrames,
+                                           outW: outW,
+                                           outH: outH,
+                                           needRender: needRender,
+                                           displaySize: CGSize(width: displayW, height: displayH),
+                                           transform: t,
+                                           progress: { p in progress(p * 0.3) })
+                }
+                segDone = true
+                break
+            } catch {
+                Diag.add("第一段第 \(attempt) 次失败：" + error.localizedDescription)
+                lastError = error
+                try? FileManager.default.removeItem(at: segURL)
+            }
+        }
+        guard segDone else {
+            throw lastError ?? ConvertError.unknown("第一段失败")
+        }
+
+        // 源时长本来就够，不用循环，片段就是成品
+        if loops == 1 {
+            progress(1.0)
+            Diag.add("时长已够 \(Int(limit)) 秒，不需要循环")
+            return segURL
+        }
+
+        // ================= 第二段：把片段原样复制 N 遍（纯封装，不解码） =================
+        let finalURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("dayan_out_\(UUID().uuidString).mp4")
+        var finalDone = false
+        for attempt in 1...3 {
+            if attempt > 1 {
+                Thread.sleep(forTimeInterval: 1.0)
+                Diag.add("复制阶段重来（第 \(attempt) 次）")
+            }
+            do {
+                try self.assemble(segment: segURL,
+                                  to: finalURL,
+                                  loops: loops,
+                                  targetSeconds: targetSeconds,
+                                  fps: fps,
+                                  progress: { p in progress(0.3 + 0.7 * p) })
+                finalDone = true
+                break
+            } catch {
+                Diag.add("复制阶段第 \(attempt) 次失败：" + error.localizedDescription)
+                lastError = error
+                try? FileManager.default.removeItem(at: finalURL)
+            }
+        }
+        try? FileManager.default.removeItem(at: segURL)
+        guard finalDone else {
+            throw lastError ?? ConvertError.unknown("复制阶段失败")
+        }
+
+        progress(1.0)
+        return finalURL
+    }
+
+    // MARK: - 第一段：解码 + （重绘）+ 编码
+
+    private func encodeSegment(source: URL,
+                               to outURL: URL,
+                               fps: Double,
+                               passFrames: Int,
+                               outW: Int,
+                               outH: Int,
+                               needRender: Bool,
+                               displaySize: CGSize,
+                               transform: CGAffineTransform,
+                               progress: @escaping (Double) -> Void) throws {
         try? FileManager.default.removeItem(at: outURL)
+
+        // 每次尝试都是全新的 asset / reader / writer，不复用任何旧对象
+        let asset = AVURLAsset(url: source)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            throw ConvertError.noVideoTrack
+        }
+
         let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
 
         let videoSettings: [String: Any] = [
@@ -171,7 +275,7 @@ final class VideoConverter {
         writer.add(videoInput)
 
         var audioInput: AVAssetWriterInput?
-        if hasAudio {
+        if !asset.tracks(withMediaType: .audio).isEmpty {
             let ai = AVAssetWriterInput(
                 mediaType: .audio,
                 outputSettings: [
@@ -192,207 +296,127 @@ final class VideoConverter {
             throw ConvertError.writerFailed(explain(writer.error, fallback: "启动写入失败"))
         }
         writer.startSession(atSourceTime: .zero)
-        Diag.add("写入器已启动，音轨=" + (audioInput == nil ? "无" : "有"))
+        Diag.add("第一段：写入器已启动，音轨=" + (audioInput == nil ? "无" : "有"))
 
-        // ---- 状态：帧号贯穿所有遍数，保证时间轴连续 ----
+        let reader = try AVAssetReader(asset: asset)
+        reader.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+
+        let vOut = AVAssetReaderTrackOutput(
+            track: videoTrack,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        )
+        guard reader.canAdd(vOut) else {
+            throw ConvertError.readerFailed("无法挂载视频输出")
+        }
+        reader.add(vOut)
+
+        var aOut: AVAssetReaderTrackOutput?
+        if audioInput != nil, let audioTrack = asset.tracks(withMediaType: .audio).first {
+            let ao = AVAssetReaderTrackOutput(
+                track: audioTrack,
+                outputSettings: [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: 44100,
+                    AVNumberOfChannelsKey: 2,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+            )
+            if reader.canAdd(ao) {
+                reader.add(ao)
+                aOut = ao
+            }
+        }
+
+        guard reader.startReading() else {
+            throw ConvertError.readerFailed(explain(reader.error, fallback: "启动读取失败"))
+        }
+
         var frameIndex = 0
-        var audioAppendedSeconds = 0.0
+        var videoDone = false
+        var audioDone = (aOut == nil)
+        var idle = 0
         var wroteAnyFrame = false
         var lastReport = Date.distantPast
-        var passNo = 0
 
-        /// 处理一帧：合成 → 按帧号写 pts → 追加
-        func appendFrame(_ sample: CMSampleBuffer) throws {
-            guard let imageBuffer = CMSampleBufferGetImageBuffer(sample) else {
-                frameIndex += 1
-                return
-            }
-            guard let pool = adaptor.pixelBufferPool else {
-                throw ConvertError.poolUnavailable
-            }
-            var outBuffer: CVPixelBuffer?
-            _ = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuffer)
-            guard let ob = outBuffer else {
-                throw ConvertError.poolUnavailable
-            }
-            self.render(source: imageBuffer,
-                        destination: ob,
-                        displaySize: CGSize(width: displayW, height: displayH),
-                        transform: transform,
-                        outW: outW,
-                        outH: outH,
-                        outRect: outRect)
-            let pts = CMTime(seconds: Double(frameIndex) / fps, preferredTimescale: 600)
-            if adaptor.append(ob, withPresentationTime: pts) {
-                wroteAnyFrame = true
-            }
-            frameIndex += 1
+        while (!videoDone || !audioDone) && frameIndex < passFrames {
+            var didSomething = false
 
-            let now = Date()
-            if now.timeIntervalSince(lastReport) > 0.2 {
-                lastReport = now
-                let p = min(1.0, Double(frameIndex) / Double(targetFrames))
-                DispatchQueue.main.async { progress(p) }
-            }
-        }
-
-        /// 读一遍源文件写到写入器里。返回这一遍（含断点续读）共写了多少帧。
-        ///
-        /// 关键：每次调用都新建 AVURLAsset 和 AVAssetReader，绝不复用旧的。
-        /// 系统解码服务崩过一次（-11819）之后，旧 asset 上的轨道对象就废了，
-        /// 拿来重试会立刻再报错，必须整套换新。
-        /// 如果这一遍之前已经写了一部分帧（中途失败过），就从断点秒数续读：
-        /// reader.timeRange 直接从断点开始，视频帧号和音轨时间轴都接着排，不用重头再来。
-        func onePass(audioOffset: CMTime, passStartFrame: Int) throws -> Int {
-            let startFrame = frameIndex
-
-            // 断点取两条轨道里写得更靠前的那个：
-            // 视频按已写帧数换算，音频按已追加的秒数换算。
-            // 音频编码快，常常跑到视频前面几秒；只按视频帧算断点的话，
-            // 续读出来的音频时间戳会倒退，会把写入器直接弄死。
-            let videoResume = Double(startFrame - passStartFrame) / fps
-            let audioResume = audioAppendedSeconds - Double(passNo - 1) * seconds
-            var resumeSeconds = max(videoResume, audioResume)
-            if resumeSeconds < 0 { resumeSeconds = 0 }
-            if resumeSeconds >= seconds - 0.1 {
-                return 0   // 这一遍其实已经写完了，不用再读
-            }
-
-            let freshAsset = AVURLAsset(url: source)
-            guard let freshVideoTrack = freshAsset.tracks(withMediaType: .video).first else {
-                throw ConvertError.noVideoTrack
-            }
-
-            let reader = try AVAssetReader(asset: freshAsset)
-            let start = CMTime(seconds: resumeSeconds, preferredTimescale: 600)
-            reader.timeRange = CMTimeRange(
-                start: start,
-                duration: CMTimeSubtract(freshAsset.duration, start)
-            )
-            if resumeSeconds > 0.05 {
-                Diag.add("从第 \(String(format: "%.1f", resumeSeconds)) 秒断点续读（已写 \(startFrame - passStartFrame) 帧）")
-            }
-
-            let vOut = AVAssetReaderTrackOutput(
-                track: freshVideoTrack,
-                outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-            )
-            guard reader.canAdd(vOut) else {
-                throw ConvertError.readerFailed("无法挂载视频输出")
-            }
-            reader.add(vOut)
-
-            var aOut: AVAssetReaderTrackOutput?
-            if audioInput != nil,
-               let freshAudioTrack = freshAsset.tracks(withMediaType: .audio).first {
-                let ao = AVAssetReaderTrackOutput(
-                    track: freshAudioTrack,
-                    outputSettings: [
-                        AVFormatIDKey: kAudioFormatLinearPCM,
-                        AVSampleRateKey: 44100,
-                        AVNumberOfChannelsKey: 2,
-                        AVLinearPCMBitDepthKey: 16,
-                        AVLinearPCMIsFloatKey: false,
-                        AVLinearPCMIsBigEndianKey: false,
-                        AVLinearPCMIsNonInterleaved: false
-                    ]
-                )
-                if reader.canAdd(ao) {
-                    reader.add(ao)
-                    aOut = ao
-                }
-            }
-
-            guard reader.startReading() else {
-                throw ConvertError.readerFailed(self.explain(reader.error, fallback: "启动读取失败"))
-            }
-
-            var videoDone = false
-            var audioDone = (aOut == nil)
-            var idle = 0
-
-            while (!videoDone || !audioDone) && frameIndex < targetFrames {
-                var didSomething = false
-
-                if !videoDone && videoInput.isReadyForMoreMediaData {
-                    if let sample = vOut.copyNextSampleBuffer() {
-                        didSomething = true
-                        try appendFrame(sample)
-                    } else {
-                        videoDone = true
-                    }
-                }
-
-                if !audioDone, let ao = aOut, let ai = audioInput, ai.isReadyForMoreMediaData {
-                    if let sample = ao.copyNextSampleBuffer() {
-                        didSomething = true
-                        // 注意：offset 只按遍数算，不含断点秒数——
-                        // 续读出来的音轨自带原始时间戳（从断点秒数起），
-                        // 再加上断点就重复了
-                        if let shifted = self.retime(sample, by: audioOffset) {
-                            if ai.append(shifted) {
-                                audioAppendedSeconds += self.bufferSeconds(sample)
-                            } else {
-                                audioDone = true
+            if !videoDone && videoInput.isReadyForMoreMediaData {
+                if let sample = vOut.copyNextSampleBuffer() {
+                    didSomething = true
+                    let pts = CMTime(seconds: Double(frameIndex) / fps, preferredTimescale: 600)
+                    if needRender {
+                        if let imageBuffer = CMSampleBufferGetImageBuffer(sample) {
+                            guard let pool = adaptor.pixelBufferPool else {
+                                throw ConvertError.poolUnavailable
+                            }
+                            var outBuffer: CVPixelBuffer?
+                            _ = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuffer)
+                            guard let ob = outBuffer else {
+                                throw ConvertError.poolUnavailable
+                            }
+                            render(source: imageBuffer,
+                                   destination: ob,
+                                   displaySize: displaySize,
+                                   transform: transform,
+                                   outW: outW,
+                                   outH: outH)
+                            if adaptor.append(ob, withPresentationTime: pts) {
+                                wroteAnyFrame = true
                             }
                         }
-                    } else {
+                    } else if let imageBuffer = CMSampleBufferGetImageBuffer(sample) {
+                        // 尺寸已达标，解码出来的画面直接交给编码器
+                        if adaptor.append(imageBuffer, withPresentationTime: pts) {
+                            wroteAnyFrame = true
+                        }
+                    }
+                    frameIndex += 1
+
+                    let now = Date()
+                    if now.timeIntervalSince(lastReport) > 0.2 {
+                        lastReport = now
+                        let p = min(1.0, Double(frameIndex) / Double(passFrames))
+                        DispatchQueue.main.async { progress(p) }
+                    }
+                } else {
+                    videoDone = true
+                }
+            }
+
+            if !audioDone, let ao = aOut, let ai = audioInput, ai.isReadyForMoreMediaData {
+                if let sample = ao.copyNextSampleBuffer() {
+                    didSomething = true
+                    if !ai.append(sample) {
                         audioDone = true
                     }
-                }
-
-                if reader.status == .failed {
-                    throw ConvertError.readerFailed(self.explain(reader.error, fallback: "读取中断"))
-                }
-                if writer.status == .failed {
-                    throw ConvertError.writerFailed(self.explain(writer.error, fallback: "写入中断"))
-                }
-
-                if !didSomething {
-                    idle += 1
-                    if idle > 4000 {
-                        throw ConvertError.writerFailed("编码器长时间不接受数据，可能是这个尺寸不被支持")
-                    }
-                    Thread.sleep(forTimeInterval: 0.003)
                 } else {
-                    idle = 0
+                    audioDone = true
                 }
             }
 
-            reader.cancelReading()
-            return frameIndex - startFrame
-        }
-
-        // ---- 主循环：一遍一遍地读，直到凑够目标帧数 ----
-        // 读取失败（解码服务崩了）就等它恢复、换一套全新解码器从断点续读，最多救 3 次。
-        // 写入器的错救不了（文件已经写坏），直接抛出。
-        while passNo < loops && frameIndex < targetFrames {
-            passNo += 1
-            let passStartFrame = frameIndex
-            let offset = CMTime(seconds: Double(passNo - 1) * seconds, preferredTimescale: 600)
-
-            var written = -1
-            var attempt = 0
-            while written < 0 {
-                attempt += 1
-                do {
-                    written = try autoreleasepool {
-                        try onePass(audioOffset: offset, passStartFrame: passStartFrame)
-                    }
-                } catch let e as ConvertError {
-                    guard case .readerFailed = e else { throw e }
-                    if attempt >= 4 {
-                        Diag.add("换了 \(attempt) 套解码器都失败，放弃")
-                        throw e
-                    }
-                    let waitSec = Double(attempt) * 1.5
-                    Diag.add("已写好 \(frameIndex) 帧不丢，等 \(String(format: "%.1f", waitSec)) 秒让系统解码服务恢复，换全新解码器续读")
-                    Thread.sleep(forTimeInterval: waitSec)
-                }
+            if reader.status == .failed {
+                throw ConvertError.readerFailed(explain(reader.error, fallback: "读取中断"))
             }
-            Diag.add("第 \(passNo) 遍完成，本遍 \(written) 帧，累计 \(frameIndex) 帧")
+            if writer.status == .failed {
+                throw ConvertError.writerFailed(explain(writer.error, fallback: "写入中断"))
+            }
+
+            if !didSomething {
+                idle += 1
+                if idle > 4000 {
+                    throw ConvertError.writerFailed("编码器长时间不接受数据，可能是这个尺寸不被支持")
+                }
+                Thread.sleep(forTimeInterval: 0.003)
+            } else {
+                idle = 0
+            }
         }
 
+        reader.cancelReading()
         videoInput.markAsFinished()
         audioInput?.markAsFinished()
 
@@ -401,7 +425,162 @@ final class VideoConverter {
             throw ConvertError.unknown("一帧都没有处理成功，可能是画面尺寸异常")
         }
 
-        Diag.add("共 \(frameIndex) 帧，开始收尾")
+        Diag.add("第一段：写进 \(frameIndex) 帧，开始收尾")
+        let sem = DispatchSemaphore(value: 0)
+        writer.finishWriting { sem.signal() }
+        sem.wait()
+
+        guard writer.status == .completed else {
+            throw ConvertError.writerFailed(explain(writer.error, fallback: "片段收尾失败"))
+        }
+        Diag.add("第一段完成")
+    }
+
+    // MARK: - 第二段：直通复制（不解码）
+
+    private func assemble(segment: URL,
+                          to outURL: URL,
+                          loops: Int,
+                          targetSeconds: Double,
+                          fps: Double,
+                          progress: @escaping (Double) -> Void) throws {
+        try? FileManager.default.removeItem(at: outURL)
+
+        let segAsset = AVURLAsset(url: segment)
+        guard let segVideo = segAsset.tracks(withMediaType: .video).first else {
+            throw ConvertError.noVideoTrack
+        }
+        let segAudio = segAsset.tracks(withMediaType: .audio).first
+        let segSeconds = CMTimeGetSeconds(segAsset.duration)
+        guard segSeconds.isFinite && segSeconds > 0.05 else {
+            throw ConvertError.unknown("片段时长为 0")
+        }
+        Diag.add("第二段：复制 \(loops) 遍，每遍 \(String(format: "%.2f", segSeconds)) 秒")
+
+        let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
+
+        // outputSettings = nil 就是直通：数据包原样搬运，不碰解码器也不碰编码器
+        let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+        vIn.expectsMediaDataInRealTime = false
+        guard writer.canAdd(vIn) else {
+            throw ConvertError.writerFailed("无法挂载视频直通")
+        }
+        writer.add(vIn)
+
+        var aIn: AVAssetWriterInput?
+        if segAudio != nil {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            ai.expectsMediaDataInRealTime = false
+            if writer.canAdd(ai) {
+                writer.add(ai)
+                aIn = ai
+            }
+        }
+
+        guard writer.startWriting() else {
+            throw ConvertError.writerFailed(explain(writer.error, fallback: "直通写入启动失败"))
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let videoFallback = CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(fps))))
+
+        for pass in 0..<loops {
+            let offset = CMTime(seconds: Double(pass) * segSeconds, preferredTimescale: 600)
+
+            let reader = try AVAssetReader(asset: segAsset)
+            let vOut = AVAssetReaderTrackOutput(track: segVideo, outputSettings: nil)
+            guard reader.canAdd(vOut) else {
+                throw ConvertError.readerFailed("无法挂载视频直通读取")
+            }
+            reader.add(vOut)
+
+            var aOut: AVAssetReaderTrackOutput?
+            if let at = segAudio {
+                let ao = AVAssetReaderTrackOutput(track: at, outputSettings: nil)
+                if reader.canAdd(ao) {
+                    reader.add(ao)
+                    aOut = ao
+                }
+            }
+
+            guard reader.startReading() else {
+                throw ConvertError.readerFailed(explain(reader.error, fallback: "直通读取启动失败"))
+            }
+
+            var videoDone = false
+            var audioDone = (aOut == nil)
+            var cut = false
+            var idle = 0
+
+            while (!videoDone || !audioDone) && !cut {
+                var didSomething = false
+
+                if !videoDone && vIn.isReadyForMoreMediaData {
+                    if let s = vOut.copyNextSampleBuffer() {
+                        didSomething = true
+                        let pts = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(s), offset)
+                        if CMTimeGetSeconds(pts) >= targetSeconds - 0.0001 {
+                            cut = true
+                        } else if CMTimeGetSeconds(pts) >= -0.001 {
+                            if let outSample = retimed(s, pts: pts, fallbackDuration: videoFallback) {
+                                if !vIn.append(outSample) {
+                                    videoDone = true
+                                }
+                            }
+                        }
+                    } else {
+                        videoDone = true
+                    }
+                }
+
+                if !cut, !audioDone, let ao = aOut, let ai = aIn, ai.isReadyForMoreMediaData {
+                    if let s = ao.copyNextSampleBuffer() {
+                        didSomething = true
+                        let pts = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(s), offset)
+                        if CMTimeGetSeconds(pts) >= targetSeconds - 0.0001 {
+                            cut = true
+                        } else if CMTimeGetSeconds(pts) >= -0.001 {
+                            let n = max(1, CMSampleBufferGetNumSamples(s))
+                            let audioFallback = CMTime(value: CMTimeValue(n), timescale: 44100)
+                            if let outSample = retimed(s, pts: pts, fallbackDuration: audioFallback) {
+                                if !ai.append(outSample) {
+                                    audioDone = true
+                                }
+                            }
+                        }
+                    } else {
+                        audioDone = true
+                    }
+                }
+
+                if reader.status == .failed {
+                    throw ConvertError.readerFailed(explain(reader.error, fallback: "直通读取中断"))
+                }
+                if writer.status == .failed {
+                    throw ConvertError.writerFailed(explain(writer.error, fallback: "直通写入中断"))
+                }
+
+                if !didSomething {
+                    idle += 1
+                    if idle > 4000 {
+                        throw ConvertError.writerFailed("复制阶段长时间没有数据，可能片段有问题")
+                    }
+                    Thread.sleep(forTimeInterval: 0.003)
+                } else {
+                    idle = 0
+                }
+            }
+
+            reader.cancelReading()
+            Diag.add("第二段：第 \(pass + 1) 遍复制完成")
+            progress(Double(pass + 1) / Double(loops))
+            if cut { break }
+        }
+
+        vIn.markAsFinished()
+        aIn?.markAsFinished()
+
+        Diag.add("第二段：开始收尾")
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }
         sem.wait()
@@ -409,39 +588,21 @@ final class VideoConverter {
         guard writer.status == .completed else {
             throw ConvertError.writerFailed(explain(writer.error, fallback: "收尾失败"))
         }
-
-        DispatchQueue.main.async { progress(1.0) }
-        return outURL
+        Diag.add("第二段完成，总时长约 \(String(format: "%.1f", min(Double(loops) * segSeconds, targetSeconds))) 秒")
     }
 
-    // MARK: - 音轨时间轴偏移
+    // MARK: - 工具
 
-    /// 一段音频采样缓冲的时长（秒），用于统计音轨写到了哪
-    private func bufferSeconds(_ sample: CMSampleBuffer) -> Double {
+    /// 复制一个采样缓冲，只换时间戳（时长和内容原样保留）。
+    /// 直通复制时用这个把每一遍的数据包挪到对应的时间位置。
+    private func retimed(_ sample: CMSampleBuffer, pts: CMTime, fallbackDuration: CMTime) -> CMSampleBuffer? {
         var dur = CMSampleBufferGetDuration(sample)
         if !dur.isValid || dur.seconds <= 0 {
-            let n = max(1, CMSampleBufferGetNumSamples(sample))
-            dur = CMTime(value: CMTimeValue(n), timescale: 44100)
+            dur = fallbackDuration
         }
-        return dur.seconds
-    }
-
-
-    /// 第 N 遍的音轨整体往后挪 (N-1)×段长，保证多个遍数接起来时间轴是连续的。
-    private func retime(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
-        if offset == .zero {
-            return sample
-        }
-        var dur = CMSampleBufferGetDuration(sample)
-        if !dur.isValid || dur.seconds <= 0 {
-            let n = max(1, CMSampleBufferGetNumSamples(sample))
-            dur = CMTime(value: CMTimeValue(n), timescale: 44100)
-        }
-        var timing = CMSampleTimingInfo(
-            duration: dur,
-            presentationTimeStamp: CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sample), offset),
-            decodeTimeStamp: .invalid
-        )
+        var timing = CMSampleTimingInfo(duration: dur,
+                                        presentationTimeStamp: pts,
+                                        decodeTimeStamp: .invalid)
         var out: CMSampleBuffer?
         let st = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
                                                        sampleBuffer: sample,
@@ -462,7 +623,7 @@ final class VideoConverter {
             s += "（\(ns.domain) \(ns.code)）"
         }
         if ns.code == -11819 || (ns.userInfo[NSUnderlyingErrorKey] as? NSError)?.code == -11819 {
-            s += "：系统解码服务崩了，重启解码器可以救"
+            s += "：系统解码服务崩了，换新解码器可以救"
         }
         return s
     }
@@ -474,8 +635,8 @@ final class VideoConverter {
                         displaySize: CGSize,
                         transform: CGAffineTransform,
                         outW: Int,
-                        outH: Int,
-                        outRect: CGRect) {
+                        outH: Int) {
+        let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
         let W = CGFloat(outW)
         let H = CGFloat(outH)
         let dw = displaySize.width
