@@ -83,15 +83,67 @@ final class VideoConverter {
         guard seconds.isFinite && seconds > 0 else {
             throw ConvertError.unknown("读不到视频时长")
         }
-        let totalFrames = max(1, Int((seconds * fps).rounded()))
+
+        // ---- 短视频循环补到 60 秒（规则与安卓版一致）----
+        // 15 秒 → 循环 4 次正好 60 秒；20 秒 → 循环 3 次 60 秒；
+        // 25 秒 → 循环 3 次 75 秒，再裁到 60 秒；本来就 ≥60 秒的保持原长。
+        let targetSeconds = 60.0
+        var loops = 1
+        if seconds < targetSeconds - 0.05 {
+            loops = max(2, Int(ceil(targetSeconds / seconds)))
+        }
+
+        let readerAsset: AVAsset
+        if loops > 1 {
+            let comp = AVMutableComposition()
+            let srcRange = CMTimeRange(start: .zero, duration: asset.duration)
+
+            guard let compVideo = comp.addMutableTrack(
+                withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                throw ConvertError.unknown("构造循环轨道失败")
+            }
+            compVideo.preferredTransform = transform
+            var cursor = CMTime.zero
+            for _ in 0..<loops {
+                try compVideo.insertTimeRange(srcRange, of: videoTrack, at: cursor)
+                cursor = CMTimeAdd(cursor, srcRange.duration)
+            }
+
+            if let audioTrack = asset.tracks(withMediaType: .audio).first,
+               let compAudio = comp.addMutableTrack(
+                   withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                cursor = CMTime.zero
+                for _ in 0..<loops {
+                    try? compAudio.insertTimeRange(srcRange, of: audioTrack, at: cursor)
+                    cursor = CMTimeAdd(cursor, srcRange.duration)
+                }
+            }
+
+            // 循环后超过 60 秒的部分裁掉（例：25 秒 x3 = 75 秒 → 60 秒）
+            let cap = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+            if cursor > cap {
+                comp.removeTimeRange(CMTimeRange(start: cap, duration: CMTimeSubtract(cursor, cap)))
+            }
+            readerAsset = comp
+        } else {
+            readerAsset = asset
+        }
+
+        let outSeconds = CMTimeGetSeconds(readerAsset.duration)
+        guard outSeconds.isFinite && outSeconds > 0 else {
+            throw ConvertError.unknown("读不到视频时长")
+        }
+        let totalFrames = max(1, Int((outSeconds * fps).rounded()))
         let fpsInt = Int(fps)
 
         // ---- 读取器 ----
-        let reader = try AVAssetReader(asset: asset)
-        reader.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+        let reader = try AVAssetReader(asset: readerAsset)
+        reader.timeRange = CMTimeRange(start: .zero, duration: readerAsset.duration)
 
+        // 合成轨道的帧率读出来可能是 0，读源轨道的
+        let readVideoTrack = readerAsset.tracks(withMediaType: .video).first ?? videoTrack
         let videoOutput = AVAssetReaderTrackOutput(
-            track: videoTrack,
+            track: readVideoTrack,
             outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         )
         videoOutput.alwaysCopiesSampleData = false
@@ -101,7 +153,7 @@ final class VideoConverter {
         reader.add(videoOutput)
 
         var audioOutput: AVAssetReaderTrackOutput?
-        if let audioTrack = asset.tracks(withMediaType: .audio).first {
+        if let audioTrack = readerAsset.tracks(withMediaType: .audio).first {
             let ao = AVAssetReaderTrackOutput(
                 track: audioTrack,
                 outputSettings: [

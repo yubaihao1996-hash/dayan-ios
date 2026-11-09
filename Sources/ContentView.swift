@@ -143,8 +143,14 @@ struct ContentView: View {
         let secs = CMTimeGetSeconds(asset.duration)
         let dur = secs.isFinite ? String(format: "%.1f", secs) : "?"
         let fps = Int(track.nominalFrameRate.rounded())
-        return name + "\n" + "\(w)×\(h) " + (portrait ? "竖版" : "横版")
+        var line = name + "\n" + "\(w)×\(h) " + (portrait ? "竖版" : "横版")
             + " · \(dur) 秒 · \(fps) 帧"
+        if secs.isFinite && secs < 59.95 {
+            let loops = max(2, Int(ceil(60.0 / secs)))
+            let final = min(Double(loops) * secs, 60.0)
+            line += "\n将循环 \(loops) 次补到 \(String(format: "%.0f", final)) 秒"
+        }
+        return line
     }
 
     // MARK: - 转换
