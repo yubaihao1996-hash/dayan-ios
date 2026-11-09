@@ -1,0 +1,46 @@
+name: DaYan
+options:
+  bundleIdPrefix: com.bh
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  DaYan:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - "Info.plist"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: 大眼转换
+        CFBundleShortVersionString: "0.1"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSPhotoLibraryUsageDescription: 需要读取你选择的视频来转换
+        NSPhotoLibraryAddUsageDescription: 需要把转换好的视频存进相册
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bh.dayan
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+
+schemes:
+  DaYan:
+    build:
+      targets:
+        DaYan: all
+    run:
+      config: Release
+    archive:
+      config: Release
