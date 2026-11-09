@@ -89,6 +89,10 @@ struct ContentView: View {
             .disabled(sourceURL == nil || busy)
 
             Spacer()
+
+            Text("版本 " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"))
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
         .padding(20)
         .alert("提示", isPresented: $showAlert) {
@@ -145,8 +149,8 @@ struct ContentView: View {
         let fps = Int(track.nominalFrameRate.rounded())
         var line = name + "\n" + "\(w)×\(h) " + (portrait ? "竖版" : "横版")
             + " · \(dur) 秒 · \(fps) 帧"
-        if secs.isFinite && secs < 59.95 {
-            let loops = max(2, Int(ceil(60.0 / secs)))
+        if secs.isFinite && secs < 59.5 {
+            let loops = max(2, Int(ceil((60.0 - 0.5) / secs)))
             let final = min(Double(loops) * secs, 60.0)
             line += "\n将循环 \(loops) 次补到 \(String(format: "%.0f", final)) 秒"
         }
@@ -159,11 +163,13 @@ struct ContentView: View {
         guard let url = sourceURL else { return }
         busy = true
         progress = 0
-        status = "正在转换 0%"
+        status = "正在准备（拼接循环）…"
 
         converter.convert(source: url, progress: { p in
             progress = p
-            status = "正在转换 " + String(Int(p * 100)) + "%"
+            if p > 0 {
+                status = "正在转换 " + String(Int(p * 100)) + "%"
+            }
         }, completion: { result in
             busy = false
             switch result {

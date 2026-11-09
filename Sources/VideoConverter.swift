@@ -28,7 +28,7 @@ enum ConvertError: LocalizedError {
 
 /// 把一条视频转成标准尺寸：竖版 1080x1920、横版 1920x1080。
 /// 非标准比例不拉伸不裁切，用同画面的模糊放大版做背景补边。
-/// 这一版先不做循环补时长，输出保持源视频的原始长度。
+/// 不足 60 秒的循环补齐（规则与安卓版一致），超过 60 秒的保持原长。
 final class VideoConverter {
 
     /// 如果真机上发现画面上下颠倒，把这里改成 true（只影响竖直方向，不影响左右）
@@ -59,8 +59,54 @@ final class VideoConverter {
             throw ConvertError.noVideoTrack
         }
 
-        let naturalSize = videoTrack.naturalSize
-        let transform = videoTrack.preferredTransform
+        var fps = Double(videoTrack.nominalFrameRate)
+        if fps < 20 || fps > 61 { fps = 30 }
+        fps = fps.rounded()
+
+        let seconds = CMTimeGetSeconds(asset.duration)
+        guard seconds.isFinite && seconds > 0 else {
+            throw ConvertError.unknown("读不到视频时长")
+        }
+
+        // ---- 短视频循环补到 60 秒（规则与安卓版一致）----
+        // 15 秒 → 循环 4 次正好 60 秒；20 秒 → 循环 3 次；
+        // 25 秒 → 循环 3 次 75 秒，再裁到 60 秒；本来就 ≥60 秒的保持原长。
+        // 留 0.5 秒余量：14.97 秒的片子按 4 次算，不会算成 5 次。
+        let targetSeconds = 60.0
+        var loops = 1
+        if seconds < targetSeconds - 0.5 {
+            loops = max(2, Int(ceil((targetSeconds - 0.5) / seconds)))
+        }
+
+        // ---- 循环拼接 ----
+        // 不把合成对象直接拿去解码：AVAssetReader 读 AVMutableComposition 时会报
+        // "Cannot Complete Action"。改成先导出成一个普通 mp4，再走 v0.1 里
+        // 已经真机验证过的读取路径。
+        var readerAsset: AVAsset = asset
+        if loops > 1 {
+            readerAsset = try buildLoopedAsset(videoTrack: videoTrack,
+                                               asset: asset,
+                                               loops: loops,
+                                               targetSeconds: targetSeconds)
+        }
+
+        let outSeconds = CMTimeGetSeconds(readerAsset.duration)
+        guard outSeconds.isFinite && outSeconds > 0 else {
+            throw ConvertError.unknown("读不到视频时长")
+        }
+        let totalFrames = max(1, Int((outSeconds * fps).rounded()))
+        let fpsInt = Int(fps)
+
+        // ---- 读取器 ----
+        let reader = try AVAssetReader(asset: readerAsset)
+        reader.timeRange = CMTimeRange(start: .zero, duration: readerAsset.duration)
+
+        // 方向和尺寸以"实际要读的那条轨道"为准。
+        // 拼接或重编码导出之后，轨道上的变换矩阵可能已经被烤进画面里，
+        // 再套一次源轨道的矩阵会导致方向二次翻转、比例算错。
+        let readVideoTrack = readerAsset.tracks(withMediaType: .video).first ?? videoTrack
+        let naturalSize = readVideoTrack.naturalSize
+        let transform = readVideoTrack.preferredTransform
 
         // 应用方向变换后的显示尺寸，用来判断横竖
         let displayRect = CGRect(origin: .zero, size: naturalSize).applying(transform)
@@ -75,73 +121,6 @@ final class VideoConverter {
         let outH = portrait ? 1920 : 1080
         let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
 
-        var fps = Double(videoTrack.nominalFrameRate)
-        if fps < 20 || fps > 61 { fps = 30 }
-        fps = fps.rounded()
-
-        let seconds = CMTimeGetSeconds(asset.duration)
-        guard seconds.isFinite && seconds > 0 else {
-            throw ConvertError.unknown("读不到视频时长")
-        }
-
-        // ---- 短视频循环补到 60 秒（规则与安卓版一致）----
-        // 15 秒 → 循环 4 次正好 60 秒；20 秒 → 循环 3 次 60 秒；
-        // 25 秒 → 循环 3 次 75 秒，再裁到 60 秒；本来就 ≥60 秒的保持原长。
-        let targetSeconds = 60.0
-        var loops = 1
-        if seconds < targetSeconds - 0.05 {
-            loops = max(2, Int(ceil(targetSeconds / seconds)))
-        }
-
-        let readerAsset: AVAsset
-        if loops > 1 {
-            let comp = AVMutableComposition()
-            let srcRange = CMTimeRange(start: .zero, duration: asset.duration)
-
-            guard let compVideo = comp.addMutableTrack(
-                withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-                throw ConvertError.unknown("构造循环轨道失败")
-            }
-            compVideo.preferredTransform = transform
-            var cursor = CMTime.zero
-            for _ in 0..<loops {
-                try compVideo.insertTimeRange(srcRange, of: videoTrack, at: cursor)
-                cursor = CMTimeAdd(cursor, srcRange.duration)
-            }
-
-            if let audioTrack = asset.tracks(withMediaType: .audio).first,
-               let compAudio = comp.addMutableTrack(
-                   withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-                cursor = CMTime.zero
-                for _ in 0..<loops {
-                    try? compAudio.insertTimeRange(srcRange, of: audioTrack, at: cursor)
-                    cursor = CMTimeAdd(cursor, srcRange.duration)
-                }
-            }
-
-            // 循环后超过 60 秒的部分裁掉（例：25 秒 x3 = 75 秒 → 60 秒）
-            let cap = CMTime(seconds: targetSeconds, preferredTimescale: 600)
-            if cursor > cap {
-                comp.removeTimeRange(CMTimeRange(start: cap, duration: CMTimeSubtract(cursor, cap)))
-            }
-            readerAsset = comp
-        } else {
-            readerAsset = asset
-        }
-
-        let outSeconds = CMTimeGetSeconds(readerAsset.duration)
-        guard outSeconds.isFinite && outSeconds > 0 else {
-            throw ConvertError.unknown("读不到视频时长")
-        }
-        let totalFrames = max(1, Int((outSeconds * fps).rounded()))
-        let fpsInt = Int(fps)
-
-        // ---- 读取器 ----
-        let reader = try AVAssetReader(asset: readerAsset)
-        reader.timeRange = CMTimeRange(start: .zero, duration: readerAsset.duration)
-
-        // 合成轨道的帧率读出来可能是 0，读源轨道的
-        let readVideoTrack = readerAsset.tracks(withMediaType: .video).first ?? videoTrack
         let videoOutput = AVAssetReaderTrackOutput(
             track: readVideoTrack,
             outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -225,13 +204,13 @@ final class VideoConverter {
         }
 
         guard writer.startWriting() else {
-            throw ConvertError.writerFailed(writer.error?.localizedDescription ?? "启动写入失败")
+            throw ConvertError.writerFailed(explain(writer.error, fallback: "启动写入失败"))
         }
         writer.startSession(atSourceTime: .zero)
 
         guard reader.startReading() else {
             writer.cancelWriting()
-            throw ConvertError.readerFailed(reader.error?.localizedDescription ?? "启动读取失败")
+            throw ConvertError.readerFailed(explain(reader.error, fallback: "启动读取失败"))
         }
 
         // ---- 逐帧处理 ----
@@ -296,10 +275,10 @@ final class VideoConverter {
 
             if reader.status == .failed {
                 writer.cancelWriting()
-                throw ConvertError.readerFailed(reader.error?.localizedDescription ?? "读取中断")
+                throw ConvertError.readerFailed(explain(reader.error, fallback: "读取中断"))
             }
             if writer.status == .failed {
-                throw ConvertError.writerFailed(writer.error?.localizedDescription ?? "写入中断")
+                throw ConvertError.writerFailed(explain(writer.error, fallback: "写入中断"))
             }
 
             if !didSomething {
@@ -324,11 +303,137 @@ final class VideoConverter {
         sem.wait()
 
         guard writer.status == .completed else {
-            throw ConvertError.writerFailed(writer.error?.localizedDescription ?? "收尾失败")
+            throw ConvertError.writerFailed(explain(writer.error, fallback: "收尾失败"))
         }
 
         DispatchQueue.main.async { progress(1.0) }
         return outURL
+    }
+
+    // MARK: - 循环拼接
+
+    /// 取轨道真正可用的时间区间，并裁到 limitSeconds 以内。
+    /// 直接拿 asset.duration 当轨道长度去 insert 会越界抛错——
+    /// 音轨通常比画面短一点点，这个差值就是上次失败的根源之一。
+    private func clampedRange(of track: AVAssetTrack, limitSeconds: Double) -> CMTimeRange {
+        let tr = track.timeRange
+        let rawStart = CMTimeGetSeconds(tr.start)
+        let rawEnd = CMTimeGetSeconds(CMTimeAdd(tr.start, tr.duration))
+
+        var start = rawStart
+        var end = rawEnd
+        if !start.isFinite || start < 0 { start = 0 }
+        if !end.isFinite || end <= start { end = limitSeconds }
+        if end > limitSeconds { end = limitSeconds }
+
+        let dur = end - start
+        if dur <= 0.01 { return tr }
+        return CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600),
+                           duration: CMTime(seconds: dur, preferredTimescale: 600))
+    }
+
+    /// 把源视频首尾相接拼成 loops 段，再裁到 targetSeconds 秒，返回可读的资产。
+    private func buildLoopedAsset(videoTrack: AVAssetTrack,
+                                  asset: AVAsset,
+                                  loops: Int,
+                                  targetSeconds: Double) throws -> AVAsset {
+        let assetSec = CMTimeGetSeconds(asset.duration)
+        let vRange = clampedRange(of: videoTrack, limitSeconds: assetSec)
+        let vSec = CMTimeGetSeconds(vRange.duration)
+        guard vSec > 0.05 else {
+            throw ConvertError.unknown("视频可用时长是 0，换一个文件试试")
+        }
+
+        let comp = AVMutableComposition()
+        guard let compVideo = comp.addMutableTrack(withMediaType: .video,
+                                                  preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw ConvertError.unknown("构造循环轨道失败")
+        }
+        compVideo.preferredTransform = videoTrack.preferredTransform
+
+        var cursor = CMTime.zero
+        for _ in 0..<loops {
+            try compVideo.insertTimeRange(vRange, of: videoTrack, at: cursor)
+            cursor = CMTimeAdd(cursor, vRange.duration)
+        }
+        let videoTotal = cursor
+
+        // 音轨：范围按音轨自己的区间收窄；任何一段插不进去就整条丢掉。
+        // 留一条空音轨会让后面的 AVAssetReader 直接读不起来。
+        if let audioTrack = asset.tracks(withMediaType: .audio).first,
+           let compAudio = comp.addMutableTrack(withMediaType: .audio,
+                                                preferredTrackID: kCMPersistentTrackID_Invalid) {
+            var aRange = clampedRange(of: audioTrack, limitSeconds: assetSec)
+            if CMTimeGetSeconds(aRange.duration) > vSec {
+                aRange = CMTimeRange(start: aRange.start,
+                                     duration: CMTime(seconds: vSec, preferredTimescale: 600))
+            }
+            var ok = CMTimeGetSeconds(aRange.duration) > 0.05
+            var ac = CMTime.zero
+            if ok {
+                for _ in 0..<loops {
+                    do {
+                        try compAudio.insertTimeRange(aRange, of: audioTrack, at: ac)
+                    } catch {
+                        ok = false
+                        break
+                    }
+                    ac = CMTimeAdd(ac, aRange.duration)
+                }
+            }
+            if !ok || compAudio.segments.isEmpty {
+                comp.removeTrack(compAudio)
+            }
+        }
+
+        // 超过 60 秒的部分裁掉（例：25 秒 x3 = 75 秒 → 60 秒）
+        let cap = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+        if videoTotal > cap {
+            comp.removeTimeRange(CMTimeRange(start: cap,
+                                             duration: CMTimeSubtract(videoTotal, cap)))
+        }
+
+        // 先无损导出（只搬运不重编码，一两秒），失败再重编码导出，
+        // 两个都失败就退回直接读合成对象。
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayan_loop_\(UUID().uuidString).mp4")
+        let presets = [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality]
+        for preset in presets {
+            try? FileManager.default.removeItem(at: tmp)
+            guard let session = AVAssetExportSession(asset: comp, presetName: preset) else {
+                continue
+            }
+            session.outputURL = tmp
+            session.outputFileType = .mp4
+            session.shouldOptimizeForNetworkUse = false
+
+            let sem = DispatchSemaphore(value: 0)
+            session.exportAsynchronously { sem.signal() }
+            sem.wait()
+
+            var bigEnough = false
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: tmp.path),
+               let size = attrs[.size] as? Int, size > 1024 {
+                bigEnough = true
+            }
+            if session.status == .completed && bigEnough {
+                return AVURLAsset(url: tmp)
+            }
+        }
+        return comp
+    }
+
+    /// 把 AVFoundation 的错误翻成人话，并带上底层错误码，方便排查
+    private func explain(_ error: Error?, fallback: String) -> String {
+        guard let e = error else { return fallback }
+        let ns = e as NSError
+        var s = ns.localizedDescription
+        if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            s += "（底层 \(under.domain) \(under.code)）"
+        } else if ns.domain == "AVFoundationErrorDomain" {
+            s += "（\(ns.code)）"
+        }
+        return s
     }
 
     // MARK: - 单帧合成
