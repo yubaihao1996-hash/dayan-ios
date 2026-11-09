@@ -17,8 +17,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 大眼转换
-        CFBundleShortVersionString: "0.6"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "0.7"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:

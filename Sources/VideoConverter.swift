@@ -459,23 +459,35 @@ final class VideoConverter {
 
         let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
 
-        // outputSettings = nil 就是直通：数据包原样搬运，不碰解码器也不碰编码器
-        let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+        // 直通（outputSettings = nil）必须同时给 sourceFormatHint：
+        // 不给的话写入器不知道这段数据是什么编码、什么尺寸，canAdd 一律返回 false。
+        guard let vHint = segVideo.formatDescriptions.first as? CMFormatDescription else {
+            throw ConvertError.writerFailed("读不到片段的视频格式信息")
+        }
+        let vIn = AVAssetWriterInput(mediaType: .video,
+                                     outputSettings: nil,
+                                     sourceFormatHint: vHint)
         vIn.expectsMediaDataInRealTime = false
         guard writer.canAdd(vIn) else {
-            throw ConvertError.writerFailed("无法挂载视频直通")
+            throw ConvertError.writerFailed("无法挂载视频直通（子类型 \(CMFormatDescriptionGetMediaSubType(vHint))）")
         }
         writer.add(vIn)
 
         var aIn: AVAssetWriterInput?
-        if segAudio != nil {
-            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+        var audioHintFound = false
+        if let segAudio = segAudio,
+           let aHint = segAudio.formatDescriptions.first as? CMFormatDescription {
+            let ai = AVAssetWriterInput(mediaType: .audio,
+                                        outputSettings: nil,
+                                        sourceFormatHint: aHint)
             ai.expectsMediaDataInRealTime = false
             if writer.canAdd(ai) {
                 writer.add(ai)
                 aIn = ai
+                audioHintFound = true
             }
         }
+        Diag.add("第二段：直通挂载完成，音轨=" + (audioHintFound ? "有" : "无"))
 
         guard writer.startWriting() else {
             throw ConvertError.writerFailed(explain(writer.error, fallback: "直通写入启动失败"))
@@ -589,26 +601,55 @@ final class VideoConverter {
             throw ConvertError.writerFailed(explain(writer.error, fallback: "收尾失败"))
         }
         Diag.add("第二段完成，总时长约 \(String(format: "%.1f", min(Double(loops) * segSeconds, targetSeconds))) 秒")
+
+        // 自检：把成品读回来，确认时长和轨道都在，出问题能直接从日志看出来
+        var sizeMB = 0
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path),
+           let bytes = attrs[.size] as? Int {
+            sizeMB = bytes / (1024 * 1024)
+        }
+        let check = AVURLAsset(url: outURL)
+        let realSeconds = CMTimeGetSeconds(check.duration)
+        Diag.add("成品自检：\(String(format: "%.2f", realSeconds)) 秒 / 视频轨 \(check.tracks(withMediaType: .video).count) / 音轨 \(check.tracks(withMediaType: .audio).count) / \(sizeMB) MB")
+        if realSeconds < targetSeconds - 1.5 {
+            Diag.add("注意：成品比目标短了 1.5 秒以上")
+        }
     }
 
     // MARK: - 工具
 
     /// 复制一个采样缓冲，只换时间戳（时长和内容原样保留）。
     /// 直通复制时用这个把每一遍的数据包挪到对应的时间位置。
+    ///
+    /// 注意：一条缓冲里可能装多个采样（压缩音频很常见），
+    /// 这时必须给每个采样各配一条时间戳，只给一条 API 会报错、样本就被丢掉了。
     private func retimed(_ sample: CMSampleBuffer, pts: CMTime, fallbackDuration: CMTime) -> CMSampleBuffer? {
-        var dur = CMSampleBufferGetDuration(sample)
-        if !dur.isValid || dur.seconds <= 0 {
-            dur = fallbackDuration
+        let n = max(1, CMSampleBufferGetNumSamples(sample))
+        var total = CMSampleBufferGetDuration(sample)
+        if !total.isValid || total.seconds <= 0 {
+            total = fallbackDuration
         }
-        var timing = CMSampleTimingInfo(duration: dur,
-                                        presentationTimeStamp: pts,
-                                        decodeTimeStamp: .invalid)
+        let step = CMTime(value: CMTimeValue(max(1, total.value / CMTimeValue(n))),
+                          timescale: total.timescale)
+
+        var timings: [CMSampleTimingInfo] = []
+        timings.reserveCapacity(n)
+        for i in 0..<n {
+            timings.append(CMSampleTimingInfo(
+                duration: step,
+                presentationTimeStamp: CMTimeAdd(pts, CMTimeMultiply(step, multiplier: Int32(i))),
+                decodeTimeStamp: .invalid
+            ))
+        }
+
         var out: CMSampleBuffer?
-        let st = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
-                                                       sampleBuffer: sample,
-                                                       sampleTimingEntryCount: 1,
-                                                       sampleTimingArray: &timing,
-                                                       sampleBufferOut: &out)
+        let st: OSStatus = timings.withUnsafeMutableBufferPointer { buf in
+            CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                  sampleBuffer: sample,
+                                                  sampleTimingEntryCount: buf.count,
+                                                  sampleTimingArray: buf.baseAddress!,
+                                                  sampleBufferOut: &out)
+        }
         return st == noErr ? out : nil
     }
 
