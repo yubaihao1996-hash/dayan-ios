@@ -41,7 +41,7 @@ enum Diag {
 
     static func dump() -> String {
         lock.lock()
-        let s = lines.suffix(26).joined(separator: "\n")
+        let s = lines.suffix(30).joined(separator: "\n")
         lock.unlock()
         return s
     }
@@ -59,8 +59,13 @@ enum Diag {
 ///
 /// 循环的实现方式：**不使用 AVMutableComposition，也不做中间导出**。
 /// 而是同一个写入器连续写多遍——每一遍开一个新的 AVAssetReader 重新读源文件，
-/// 帧号接着往下排、音轨时间轴按段偏移。这样读取的永远是一个普通视频文件，
-/// 避开了 AVAssetReader 读合成对象时报 -11800 / -11819 的问题。
+/// 帧号接着往下排、音轨时间轴按段偏移。
+///
+/// 关于 -11819：真机实测系统的解码服务（mediaserverd）偶尔会在转换中途崩一次。
+/// 崩过之后，旧 AVAsset 上的轨道对象就作废了，复用它们重试会立刻再报同样的错。
+/// 所以 v0.5 的做法是：读取一旦失败，等系统把解码服务拉起来（1.5 秒起步），
+/// 然后**整套换新**（新建 AVURLAsset + AVAssetReader），并从断点处续读——
+/// 已经写好的帧不浪费，输出时间轴照常连续。
 final class VideoConverter {
 
     /// 如果真机上发现画面上下颠倒，把这里改成 true（只影响竖直方向，不影响左右）
@@ -129,6 +134,9 @@ final class VideoConverter {
         let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
         Diag.add("画面 \(Int(displayW))x\(Int(displayH)) → \(outW)x\(outH)")
 
+        // 源文件有没有音轨（后面每遍读取都重新确认）
+        let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+
         // ---- 写入器 ----
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("dayan_out_\(UUID().uuidString).mp4")
@@ -162,8 +170,6 @@ final class VideoConverter {
         }
         writer.add(videoInput)
 
-        // 源文件有音轨才建音频输入
-        let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
         var audioInput: AVAssetWriterInput?
         if hasAudio {
             let ai = AVAssetWriterInput(
@@ -190,6 +196,7 @@ final class VideoConverter {
 
         // ---- 状态：帧号贯穿所有遍数，保证时间轴连续 ----
         var frameIndex = 0
+        var audioAppendedSeconds = 0.0
         var wroteAnyFrame = false
         var lastReport = Date.distantPast
         var passNo = 0
@@ -229,18 +236,47 @@ final class VideoConverter {
             }
         }
 
-        /// 读一遍源文件，写到写入器里。返回这一遍写了多少帧。
-        func onePass(audioOffset: CMTime) throws -> Int {
+        /// 读一遍源文件写到写入器里。返回这一遍（含断点续读）共写了多少帧。
+        ///
+        /// 关键：每次调用都新建 AVURLAsset 和 AVAssetReader，绝不复用旧的。
+        /// 系统解码服务崩过一次（-11819）之后，旧 asset 上的轨道对象就废了，
+        /// 拿来重试会立刻再报错，必须整套换新。
+        /// 如果这一遍之前已经写了一部分帧（中途失败过），就从断点秒数续读：
+        /// reader.timeRange 直接从断点开始，视频帧号和音轨时间轴都接着排，不用重头再来。
+        func onePass(audioOffset: CMTime, passStartFrame: Int) throws -> Int {
             let startFrame = frameIndex
 
-            let reader = try AVAssetReader(asset: asset)
-            reader.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+            // 断点取两条轨道里写得更靠前的那个：
+            // 视频按已写帧数换算，音频按已追加的秒数换算。
+            // 音频编码快，常常跑到视频前面几秒；只按视频帧算断点的话，
+            // 续读出来的音频时间戳会倒退，会把写入器直接弄死。
+            let videoResume = Double(startFrame - passStartFrame) / fps
+            let audioResume = audioAppendedSeconds - Double(passNo - 1) * seconds
+            var resumeSeconds = max(videoResume, audioResume)
+            if resumeSeconds < 0 { resumeSeconds = 0 }
+            if resumeSeconds >= seconds - 0.1 {
+                return 0   // 这一遍其实已经写完了，不用再读
+            }
+
+            let freshAsset = AVURLAsset(url: source)
+            guard let freshVideoTrack = freshAsset.tracks(withMediaType: .video).first else {
+                throw ConvertError.noVideoTrack
+            }
+
+            let reader = try AVAssetReader(asset: freshAsset)
+            let start = CMTime(seconds: resumeSeconds, preferredTimescale: 600)
+            reader.timeRange = CMTimeRange(
+                start: start,
+                duration: CMTimeSubtract(freshAsset.duration, start)
+            )
+            if resumeSeconds > 0.05 {
+                Diag.add("从第 \(String(format: "%.1f", resumeSeconds)) 秒断点续读（已写 \(startFrame - passStartFrame) 帧）")
+            }
 
             let vOut = AVAssetReaderTrackOutput(
-                track: videoTrack,
+                track: freshVideoTrack,
                 outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
             )
-            vOut.alwaysCopiesSampleData = false
             guard reader.canAdd(vOut) else {
                 throw ConvertError.readerFailed("无法挂载视频输出")
             }
@@ -248,9 +284,9 @@ final class VideoConverter {
 
             var aOut: AVAssetReaderTrackOutput?
             if audioInput != nil,
-               let audioTrack = asset.tracks(withMediaType: .audio).first {
+               let freshAudioTrack = freshAsset.tracks(withMediaType: .audio).first {
                 let ao = AVAssetReaderTrackOutput(
-                    track: audioTrack,
+                    track: freshAudioTrack,
                     outputSettings: [
                         AVFormatIDKey: kAudioFormatLinearPCM,
                         AVSampleRateKey: 44100,
@@ -261,7 +297,6 @@ final class VideoConverter {
                         AVLinearPCMIsNonInterleaved: false
                     ]
                 )
-                ao.alwaysCopiesSampleData = false
                 if reader.canAdd(ao) {
                     reader.add(ao)
                     aOut = ao
@@ -291,8 +326,13 @@ final class VideoConverter {
                 if !audioDone, let ao = aOut, let ai = audioInput, ai.isReadyForMoreMediaData {
                     if let sample = ao.copyNextSampleBuffer() {
                         didSomething = true
+                        // 注意：offset 只按遍数算，不含断点秒数——
+                        // 续读出来的音轨自带原始时间戳（从断点秒数起），
+                        // 再加上断点就重复了
                         if let shifted = self.retime(sample, by: audioOffset) {
-                            if !ai.append(shifted) {
+                            if ai.append(shifted) {
+                                audioAppendedSeconds += self.bufferSeconds(sample)
+                            } else {
                                 audioDone = true
                             }
                         }
@@ -324,25 +364,33 @@ final class VideoConverter {
         }
 
         // ---- 主循环：一遍一遍地读，直到凑够目标帧数 ----
+        // 读取失败（解码服务崩了）就等它恢复、换一套全新解码器从断点续读，最多救 3 次。
+        // 写入器的错救不了（文件已经写坏），直接抛出。
         while passNo < loops && frameIndex < targetFrames {
             passNo += 1
+            let passStartFrame = frameIndex
             let offset = CMTime(seconds: Double(passNo - 1) * seconds, preferredTimescale: 600)
 
-            var attempt = 0
             var written = -1
+            var attempt = 0
             while written < 0 {
                 attempt += 1
                 do {
-                    written = try autoreleasepool { try onePass(audioOffset: offset) }
-                } catch {
-                    Diag.add("第 \(passNo) 遍失败：" + error.localizedDescription)
-                    if attempt >= 2 { throw error }
-                    Diag.add("0.8 秒后重试一次")
-                    Thread.sleep(forTimeInterval: 0.8)
+                    written = try autoreleasepool {
+                        try onePass(audioOffset: offset, passStartFrame: passStartFrame)
+                    }
+                } catch let e as ConvertError {
+                    guard case .readerFailed = e else { throw e }
+                    if attempt >= 4 {
+                        Diag.add("换了 \(attempt) 套解码器都失败，放弃")
+                        throw e
+                    }
+                    let waitSec = Double(attempt) * 1.5
+                    Diag.add("已写好 \(frameIndex) 帧不丢，等 \(String(format: "%.1f", waitSec)) 秒让系统解码服务恢复，换全新解码器续读")
+                    Thread.sleep(forTimeInterval: waitSec)
                 }
             }
             Diag.add("第 \(passNo) 遍完成，本遍 \(written) 帧，累计 \(frameIndex) 帧")
-            if written == 0 { break }
         }
 
         videoInput.markAsFinished()
@@ -368,7 +416,18 @@ final class VideoConverter {
 
     // MARK: - 音轨时间轴偏移
 
-    /// 第 N 遍的音轨整体往后挪 N×段长，保证多个遍数接起来时间轴是连续的。
+    /// 一段音频采样缓冲的时长（秒），用于统计音轨写到了哪
+    private func bufferSeconds(_ sample: CMSampleBuffer) -> Double {
+        var dur = CMSampleBufferGetDuration(sample)
+        if !dur.isValid || dur.seconds <= 0 {
+            let n = max(1, CMSampleBufferGetNumSamples(sample))
+            dur = CMTime(value: CMTimeValue(n), timescale: 44100)
+        }
+        return dur.seconds
+    }
+
+
+    /// 第 N 遍的音轨整体往后挪 (N-1)×段长，保证多个遍数接起来时间轴是连续的。
     private func retime(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
         if offset == .zero {
             return sample
@@ -398,9 +457,12 @@ final class VideoConverter {
         let ns = e as NSError
         var s = ns.localizedDescription
         if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-            s += "（底层 \(under.domain) \(under.code)）"
-        } else if ns.domain == "AVFoundationErrorDomain" {
-            s += "（\(ns.code)）"
+            s += "（\(under.domain) \(under.code)）"
+        } else {
+            s += "（\(ns.domain) \(ns.code)）"
+        }
+        if ns.code == -11819 || (ns.userInfo[NSUnderlyingErrorKey] as? NSError)?.code == -11819 {
+            s += "：系统解码服务崩了，重启解码器可以救"
         }
         return s
     }
